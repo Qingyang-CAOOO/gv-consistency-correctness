@@ -1,0 +1,42 @@
+experiment:
+  name: triviaqa_gemma2_2b_it_cft_train
+  stage: training_data_generation
+
+data:
+  source: rankalign
+  task: triviaqa
+  split: train
+  limit: 512
+  preserve_upstream_split: true
+  data_seed: 142
+
+model:
+  name: google/gemma-2-2b-it
+  dtype: bfloat16
+  chat_template: true
+
+generator:
+  prompt_family: gv_paper_qa
+  mode: greedy
+  generation_seed: 143
+  max_new_tokens: 32
+  temperature: 0.8
+  top_p: 0.95
+
+validator:
+  randomization_scheme: validator_order
+  labels: ["A", "B"]
+  balanced: true
+  order_seed: 144
+  temperature: 1.0
+  sampled_hard_draws: 1024
+  validator_sample_seed: 145
+  paired_order_diagnostic: false
+
+outputs:
+  path: outputs/triviaqa_generated_gv/gemma2_2b_it_greedy_train_n512.jsonl
+
+notes:
+  - Generate once and reuse the identical JSONL for hard and soft CFT.
+  - Do not use test examples for fine-tuning.
+  - Parse failures remain excluded from both hard and soft CFT identically.

@@ -1,0 +1,14 @@
+# Colab-oriented environment. Keep Colab's CUDA-matched torch build.
+# bitsandbytes is intentionally omitted: current experiments use BF16 LoRA, not 4/8-bit quantization.
+wandb>=0.19.0
+datasets==3.1.0
+transformers==4.46.2
+tokenizers==0.20.3
+accelerate==1.1.0
+peft==0.14.0
+trl==0.12.2
+scikit-learn==1.5.2
+scipy==1.14.1
+pandas>=2.2.3
+pyyaml>=6.0
+pytest>=8.0

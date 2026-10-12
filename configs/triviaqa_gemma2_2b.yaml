@@ -1,0 +1,39 @@
+experiment:
+  name: triviaqa_gemma2_2b_soft_gv
+  seed: 42
+
+data:
+  source: rankalign
+  task: triviaqa
+  preserve_upstream_split: true
+
+model:
+  name: google/gemma-2-2b
+  dtype: auto
+  load_in_4bit: false
+
+randomization:
+  scheme: validator_order
+  labels: ["A", "B"]
+  balanced: true
+  seed: 42
+
+weighting:
+  mode: soft
+  normalize_over_validator_labels: true
+  temperature: 1.0
+  eps: 1.0e-12
+
+training:
+  method: lora
+  learning_rate: 2.0e-4
+  lora_r: 16
+  lora_alpha: 32
+  gradient_checkpointing: true
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+
+smc:
+  enabled: false
+  resample_threshold_ess_fraction: 0.5
+  resampling_method: systematic

@@ -1,0 +1,49 @@
+experiment:
+  name: triviaqa_gemma2_2b_it_generated_gv
+  stage: measurement
+  status: frozen_after_n128_validation
+
+data:
+  source: rankalign
+  task: triviaqa
+  split: test
+  preserve_upstream_split: true
+  data_seed: 42
+
+model:
+  name: google/gemma-2-2b-it
+  dtype: bfloat16
+  chat_template: true
+
+generator:
+  prompt_family: gv_paper_qa
+  mode: greedy
+  generation_seed: 43
+  max_new_tokens: 32
+  temperature: 0.8
+  top_p: 0.95
+  parse_policy:
+    canonical_delimiter: "||"
+    accept_standalone_answer_marker: true
+    accept_explicit_correct_misleading_labels: true
+    reject_missing_candidate: true
+    reject_multiple_delimiters: true
+
+validator:
+  randomization_scheme: validator_order
+  labels: ["A", "B"]
+  balanced: true
+  order_seed: 44
+  temperature: 1.0
+  sampled_hard_draws: 1024
+  validator_sample_seed: 45
+  paired_order_diagnostic: true
+
+weighting:
+  hard: greedy_argmax_match
+  sampled_hard: categorical_match
+  soft: normalized_target_label_probability
+  normalize_over_validator_labels: true
+
+smc:
+  enabled: false

@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from tqdm import tqdm
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Run the paper-style iterative consistency-FT loop for hard and soft GV filtering. "
+            "Iteration 1 adapters may be reused from Phase 1; later rounds regenerate GV data "
+            "with the previous iteration and retrain a fresh LoRA adapter from the same base model."
+        )
+    )
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--hard-iter1-adapter", required=True)
+    p.add_argument("--soft-iter1-adapter", required=True)
+    p.add_argument("--model", default="google/gemma-2-2b-it")
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--train-limit", type=int, default=512)
+    p.add_argument("--test-limit", type=int, default=512)
+    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--updates-per-epoch", type=int, default=41)
+    p.add_argument("--training-seed", type=int, default=2026)
+    p.add_argument("--train-data-seed", type=int, default=142)
+    p.add_argument("--train-generation-seed", type=int, default=143)
+    p.add_argument("--train-order-seed", type=int, default=144)
+    p.add_argument("--train-validator-sample-seed", type=int, default=145)
+    p.add_argument("--test-data-seed", type=int, default=42)
+    p.add_argument("--test-generation-seed", type=int, default=43)
+    p.add_argument("--test-order-seed", type=int, default=44)
+    p.add_argument("--test-validator-sample-seed", type=int, default=45)
+    p.add_argument("--force", action="store_true")
+    return p.parse_args()
+
+
+def run(cmd):
+    print("\n$", " ".join(str(x) for x in cmd), flush=True)
+    subprocess.run([str(x) for x in cmd], check=True)
+
+
+def exists_complete_jsonl(path: Path) -> bool:
+    return path.exists() and path.with_suffix(".summary.json").exists()
+
+
+def run_gv(args, *, adapter, split, output, train):
+    if exists_complete_jsonl(output) and not args.force:
+        print(f"reuse: {output}")
+        return
+    cmd = [
+        sys.executable, "scripts/run_triviaqa_gv.py",
+        "--model", args.model,
+        "--split", split,
+        "--limit", str(args.train_limit if train else args.test_limit),
+        "--data-seed", str(args.train_data_seed if train else args.test_data_seed),
+        "--generation-seed", str(args.train_generation_seed if train else args.test_generation_seed),
+        "--order-seed", str(args.train_order_seed if train else args.test_order_seed),
+        "--validator-sample-seed", str(
+            args.train_validator_sample_seed if train else args.test_validator_sample_seed
+        ),
+        "--generation-mode", "greedy",
+        "--output", str(output),
+    ]
+    if adapter is not None:
+        cmd += ["--adapter", str(adapter)]
+    if not train:
+        cmd += ["--paired-order-diagnostic"]
+    run(cmd)
+
+
+def train_round(args, *, mode, data, output_dir):
+    summary = output_dir / "gvsmc_training_summary.json"
+    if summary.exists() and not args.force:
+        print(f"reuse: {output_dir}")
+        return
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, "scripts/train_cft.py",
+        "--data", str(data),
+        "--mode", mode,
+        "--model", args.model,
+        "--output-dir", str(output_dir),
+        "--epochs", str(args.epochs),
+        "--updates-per-epoch", str(args.updates_per_epoch),
+        "--seed", str(args.training_seed),
+    ]
+    run(cmd)
+
+
+def load_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_manifest(args, root):
+    rows = []
+    base_eval = root / "eval" / f"base_test_n{args.test_limit}.summary.json"
+    if base_eval.exists():
+        s = load_json(base_eval)
+        rows.append({"mode": "base", "iteration": 0, **s})
+
+    for mode in ("hard", "soft"):
+        for iteration in range(1, args.rounds + 1):
+            eval_path = root / "eval" / mode / f"iter{iteration}_test_n{args.test_limit}.summary.json"
+            train_path = (
+                Path(args.hard_iter1_adapter if mode == "hard" else args.soft_iter1_adapter)
+                if iteration == 1
+                else root / "checkpoints" / mode / f"iter{iteration}"
+            ) / "gvsmc_training_summary.json"
+            item = {"mode": mode, "iteration": iteration}
+            if eval_path.exists():
+                item["evaluation"] = load_json(eval_path)
+            if train_path.exists():
+                item["training"] = load_json(train_path)
+            rows.append(item)
+
+    manifest = {
+        "model": args.model,
+        "rounds": args.rounds,
+        "train_limit": args.train_limit,
+        "test_limit": args.test_limit,
+        "training_semantics": (
+            "Paper-style reset-to-base: data for iteration t are generated by adapter iter(t-1), "
+            "then iter(t) is a fresh LoRA adapter trained on the same base model using only the new round data."
+        ),
+        "hard_potential": "C in {0,1}: keep greedy-consistent trajectories only",
+        "soft_potential": "G in [0,1]: keep every parsed trajectory and weight by target probability",
+        "matched_training_budget": {
+            "epochs": args.epochs,
+            "updates_per_epoch": args.updates_per_epoch,
+            "training_seed": args.training_seed,
+        },
+        "records": rows,
+    }
+    out = root / "iterative_cft_manifest.json"
+    out.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote: {out}")
+
+
+def main():
+    args = parse_args()
+    if args.rounds < 1:
+        raise ValueError("--rounds must be at least 1")
+    root = Path(args.artifact_root)
+    (root / "training-data").mkdir(parents=True, exist_ok=True)
+    (root / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (root / "eval").mkdir(parents=True, exist_ok=True)
+
+    # High-level bar counts inference/training stages. For accurate ETA inside
+    # a stage, see the nested GV-sample or CFT-optimizer progress bar.
+    total_stages = 1 + 2 * (1 + 3 * (args.rounds - 1))
+    progress = tqdm(
+        total=total_stages, desc="Iterative CFT stages",
+        unit="stage", dynamic_ncols=True, mininterval=1.0,
+    )
+    base_eval = root / "eval" / f"base_test_n{args.test_limit}.jsonl"
+    progress.set_postfix_str("base evaluation")
+    run_gv(args, adapter=None, split="test", output=base_eval, train=False)
+    progress.update(1)
+
+    iter1 = {
+        "hard": Path(args.hard_iter1_adapter),
+        "soft": Path(args.soft_iter1_adapter),
+    }
+
+    for mode in ("hard", "soft"):
+        print("\n" + "=" * 88)
+        print(f"ITERATIVE {mode.upper()} CFT")
+        print("=" * 88)
+        previous_adapter = iter1[mode]
+        if not previous_adapter.exists():
+            raise FileNotFoundError(f"missing iteration-1 adapter: {previous_adapter}")
+
+        # Evaluate the already-existing Phase-1 iteration-1 adapter on the common N-test set.
+        eval1 = root / "eval" / mode / f"iter1_test_n{args.test_limit}.jsonl"
+        eval1.parent.mkdir(parents=True, exist_ok=True)
+        progress.set_postfix_str(f"{mode} iteration 1 evaluation")
+        run_gv(args, adapter=previous_adapter, split="test", output=eval1, train=False)
+        progress.update(1)
+
+        for iteration in range(2, args.rounds + 1):
+            # D_{iteration-1}: regenerated with theta_{iteration-1}.
+            train_data = (
+                root / "training-data" / mode /
+                f"from_iter{iteration - 1}_train_n{args.train_limit}.jsonl"
+            )
+            train_data.parent.mkdir(parents=True, exist_ok=True)
+            progress.set_postfix_str(f"{mode} iteration {iteration} generation")
+            run_gv(
+                args, adapter=previous_adapter, split="train",
+                output=train_data, train=True
+            )
+            progress.update(1)
+
+            # Match the paper: fit theta_iteration from the base LM, not by continuing theta_{iteration-1}.
+            current_adapter = root / "checkpoints" / mode / f"iter{iteration}"
+            progress.set_postfix_str(f"{mode} iteration {iteration} training")
+            train_round(
+                args, mode=mode, data=train_data, output_dir=current_adapter
+            )
+            progress.update(1)
+
+            current_eval = (
+                root / "eval" / mode /
+                f"iter{iteration}_test_n{args.test_limit}.jsonl"
+            )
+            current_eval.parent.mkdir(parents=True, exist_ok=True)
+            progress.set_postfix_str(f"{mode} iteration {iteration} evaluation")
+            run_gv(
+                args, adapter=current_adapter, split="test",
+                output=current_eval, train=False
+            )
+            progress.update(1)
+            previous_adapter = current_adapter
+
+    progress.close()
+    build_manifest(args, root)
+
+
+if __name__ == "__main__":
+    main()
